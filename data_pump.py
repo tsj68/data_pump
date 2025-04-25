@@ -30,13 +30,25 @@ class DatabaseConnector:
         if db_type == 'sqlite':
             return f"sqlite:///{db_config['database']}"
         elif db_type == 'hive':
-            return f"hive://{db_config.get('host', 'localhost')}:{db_config.get('port', 10000)}/{db_config['database']}"
+            return f"hive://hadoop@{db_config.get('host', 'localhost')}:{db_config.get('port', 10000)}/{db_config['database']}"
+        elif db_type == 'oracle':
+            # Oracle 使用服务名（service_name）的格式
+            return (
+                f"oracle+cx_oracle://{db_config['user']}:{db_config['password']}@"
+                f"{db_config['host']}:{db_config.get('port', 1521)}/"
+                f"?service_name={db_config['database']}"
+            )
         else:
             return (
                 f"{driver}://{db_config['user']}:{db_config['password']}@"
                 f"{db_config['host']}:{db_config.get('port', '')}/"
                 f"{db_config['database']}"
             )
+
+    def get_engine(self, db_config: Dict):
+        """生成并返回 SQLAlchemy 引擎"""
+        conn_str = self.get_connection_string(db_config)
+        return create_engine(conn_str)
 
     @contextmanager
     def connect(self, db_config: Dict):
@@ -57,39 +69,43 @@ class DatabaseConnector:
 class DataMigrator:
     def __init__(self):
         self.connector = DatabaseConnector()
-    
-    def read_data(self, source_config: Dict, query: str, chunksize: Optional[int] = None) -> Union[List[Dict], pd.DataFrame]:
-        """从源数据库读取数据"""
+
+    # 修改后的 read_data 方法（方法1示例）
+    def read_data(self, source_config: Dict, query: str, chunksize: Optional[int] = None) -> pd.DataFrame:
         try:
             with self.connector.connect(source_config) as conn:
-                if chunksize:
-                    # 分批读取大数据
-                    return pd.read_sql(query, conn, chunksize=chunksize)
-                else:
-                    # 小数据直接读取
-                    return pd.read_sql(query, conn)
+                # 获取底层 pyhive 连接
+                raw_conn = conn.connection
+                cursor = raw_conn.cursor()
+                cursor.execute(query)
+                data = cursor.fetchall()
+                columns = [col[0] for col in cursor.description]
+                df = pd.DataFrame(data, columns=columns)
+                return df
         except Exception as e:
             logger.error(f"数据读取失败: {str(e)}")
             raise
-    
-    def write_data(self, target_config: Dict, data: Union[List[Dict], pd.DataFrame], table_name: str, if_exists: str = 'append'):
-        """写入数据到目标数据库"""
+
+    def write_data(self, target_config: Dict, data: Union[List[Dict], pd.DataFrame], table_name: str,
+                   if_exists: str = 'append'):
+        """写入数据到目标数据库（修复版）"""
         try:
-            with self.connector.connect(target_config) as conn:
+            engine = self.connector.get_engine(target_config)
+            # 通过 engine 创建连接并管理事务
+            with engine.begin() as conn:
                 if isinstance(data, pd.DataFrame):
                     data.to_sql(
-                        table_name, 
-                        conn, 
-                        if_exists=if_exists, 
+                        table_name,
+                        conn,  # 传递连接对象而非引擎
+                        if_exists=if_exists,
                         index=False
                     )
                 else:
-                    # 列表字典数据转换为DataFrame
                     df = pd.DataFrame(data)
                     df.to_sql(
-                        table_name, 
-                        conn, 
-                        if_exists=if_exists, 
+                        table_name,
+                        conn,  # 传递连接对象而非引擎
+                        if_exists=if_exists,
                         index=False
                     )
                 logger.info(f"成功写入数据到表 {table_name}")
@@ -121,26 +137,26 @@ class DataMigrator:
 if __name__ == "__main__":
     # 源数据库配置 (可以是MySQL/Oracle/Hive等)
     source_config = {
-        'type': 'mysql',  # 支持mysql/oracle/hive/postgresql/sqlite等
-        'host': 'source_host',
-        'port': 3306,
-        'user': 'username',
-        'password': 'password',
-        'database': 'source_db'
+        'type': 'hive',  # 支持mysql/oracle/hive/postgresql/sqlite等
+        'host': '10.203.18.65',
+        'port': 7001,
+        'user': 'hadoop',
+        'password': 'xxx',
+        'database': 'data_cs'
     }
     
     # 目标数据库配置
     target_config = {
         'type': 'oracle',  # 可以是不同类型的数据库
-        'host': 'target_host',
+        'host': '192.168.5.194',
         'port': 1521,
-        'user': 'username',
-        'password': 'password',
-        'database': 'target_db'
+        'user': 'zfl',
+        'password': 'ncbz$741',
+        'database': 'sale'
     }
     
     # SQL查询语句
-    query = "SELECT * FROM source_table WHERE create_date > '2023-01-01'"
+    query = "SELECT cdate,store_id,item_id,sum(hs_wq_amt) hs_wq_amt FROM data_cs.dwd_trd_salord_item_di where cdate=date '2025-04-20' group by cdate,store_id,item_id"
     
     # 创建迁移器并执行
     migrator = DataMigrator()
@@ -150,7 +166,7 @@ if __name__ == "__main__":
         source_config=source_config,
         target_config=target_config,
         query=query,
-        target_table="target_table"
+        target_table="TEST"
     )
     
     # 大数据量分批迁移 (示例)
